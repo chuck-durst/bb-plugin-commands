@@ -3,6 +3,14 @@
 Run a project's commands (`pnpm start`, `pnpm test --watch`, …) from the
 thread header, like Conductor.
 
+## Install
+
+```
+bb plugin install git:https://github.com/chuck-durst/bb-plugin-commands.git@^0.1.0
+```
+
+Requires bb 0.45+ and Plugin SDK 0.6.15+.
+
 ## Configure
 
 Commit a `.bb-commands.json` at the repo root:
@@ -17,8 +25,14 @@ Commit a `.bb-commands.json` at the repo root:
 ```
 
 The file is read from the thread's workspace, so every branch or worktree can
-have its own commands. Like `.bb-env-setup.sh`, it must be tracked by git to
-exist in new worktrees.
+have its own commands.
+
+A new worktree only contains tracked files. When a worktree has no
+`.bb-commands.json`, the plugin falls back to the one in the project's source
+checkout (same machine). So in a shared repo where bb config is unwelcome, you
+can keep the file untracked in your main checkout (add it to
+`.git/info/exclude`) and every worktree still gets the commands. Commands
+always run in the thread's own workspace.
 
 ## Use
 
