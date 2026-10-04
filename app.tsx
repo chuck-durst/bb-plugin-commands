@@ -6,6 +6,7 @@
 // - Sidebar: a running indicator on threads with an active command. Row
 //   statuses can only be set from a content script, which has no hooks, so an
 //   invisible app overlay fetches the running threads and hands them over.
+//   The PR Status plugin yields these rows (see `publishRunningRows`).
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import {
@@ -626,6 +627,18 @@ const RUNNING_STATUS: PluginComposerThreadRowStatus = {
   tone: "running",
 };
 
+// Shared with bb-plugin-pr-status. bb shows one status per row: the first
+// plugin to set one keeps the row until it clears it. A running command
+// matters more than a PR badge, so the rows this plugin marks are published
+// here and lower-priority plugins stay off them.
+const RUNNING_THREADS_GLOBAL = "__bbCommandsRunningThreads";
+const RUNNING_THREADS_EVENT = "bb-commands:running-threads";
+
+function publishRunningRows(threadIds: ReadonlySet<string>): void {
+  (globalThis as Record<string, unknown>)[RUNNING_THREADS_GLOBAL] = new Set(threadIds);
+  window.dispatchEvent(new Event(RUNNING_THREADS_EVENT));
+}
+
 /** Bridges the hook-based overlay to the content script's row setter. */
 const rowStatusBridge = {
   setter: null as RowStatusSetter | null,
@@ -641,6 +654,7 @@ const rowStatusBridge = {
       if (!this.applied.has(threadId)) setter(threadId, RUNNING_STATUS);
     }
     this.applied = new Set(this.wanted);
+    publishRunningRows(this.applied);
   },
 };
 
@@ -693,6 +707,7 @@ export default definePluginApp((app) => {
         // The host clears this generation's statuses itself.
         rowStatusBridge.setter = null;
         rowStatusBridge.applied = new Set();
+        publishRunningRows(rowStatusBridge.applied);
       };
     },
   });

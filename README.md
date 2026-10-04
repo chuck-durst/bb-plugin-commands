@@ -41,6 +41,8 @@ always run in the thread's own workspace.
 - **Commands tab** (thread right panel): one entry per run with its status,
   read-only colored logs, Stop / Restart / remove.
 - **Sidebar**: threads with a running command show an animated indicator.
+  It takes precedence over the PR Status plugin's PR glyph on the same row
+  (published on `globalThis.__bbCommandsRunningThreads`).
 
 Each run is a bb terminal scoped to the thread (`bb terminal list --thread
 <id>`), started in command mode so it exits with the command. Stop sends
