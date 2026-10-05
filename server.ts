@@ -100,6 +100,23 @@ function trimSlashes(path: string): string {
   return path.replace(/[\\/]+$/, "");
 }
 
+/**
+ * `command` run through an interactive login shell, so it sees the same
+ * environment as the user's own terminal.
+ *
+ * A bb terminal in command mode runs `$SHELL -c`, which skips `~/.zshrc`
+ * (or `~/.bashrc`): version managers loaded there (nvm, fnm, asdf…) never
+ * kick in, and `node` resolves to whatever sits on the bare PATH, which is
+ * often not the version the project pins. `-i -l` loads both rc and profile.
+ * `exec` hands the PTY to that shell, so Ctrl-C and the exit code still
+ * reach the command. Windows shells have no such split: left untouched.
+ */
+export function inUserShell(command: string, platform = process.platform): string {
+  if (platform === "win32") return command;
+  const quoted = `'${command.replaceAll("'", `'\\''`)}'`;
+  return `exec "\${SHELL:-/bin/sh}" -ilc ${quoted}`;
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -304,7 +321,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const session = await bb.sdk.terminals.create({
         scope: { kind: "thread", threadId },
-        start: { mode: "command", command: definition.command },
+        start: { mode: "command", command: inUserShell(definition.command) },
         title: `▶ ${definition.name}`,
         cols: 160,
         rows: 40,
