@@ -9,6 +9,7 @@
 // indicator stay current.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { DISPLAY_SETTINGS } from "./lib/bb-compat";
 
 export const CONFIG_FILE_NAME = ".bb-commands.json";
 
@@ -41,6 +42,22 @@ const runSchema = z.object({
 export type CommandRun = z.infer<typeof runSchema>;
 
 const outputChunkSchema = z.object({ seq: z.number(), dataBase64: z.string() });
+
+const displaySchema = z.enum(["plugin", "bb"]);
+
+/** Settings, editable in bb's plugin settings and `bb plugin config`. */
+const SETTINGS = {
+  display: {
+    type: "select" as const,
+    label: "Header display",
+    description:
+      "auto: the plugin's own button and logs panel while bb supports them, else bb's shared header button. " +
+      "plugin: always the plugin's own button (bb's when this bb no longer supports it). " +
+      "bb: entries in bb's shared header button, after Commit and PR Status (bb 0.49+).",
+    options: [...DISPLAY_SETTINGS],
+    default: "auto",
+  },
+};
 
 export const rpcContract = defineRpcContract({
   commands_get: {
@@ -78,6 +95,11 @@ export const rpcContract = defineRpcContract({
   commands_running_threads: {
     input: z.null(),
     output: z.object({ threadIds: z.array(z.string()) }),
+  },
+  /** The app reports a `display` setting this bb cannot honor, for the log. */
+  commands_display_fallback: {
+    input: z.object({ requested: displaySchema, used: displaySchema }),
+    output: z.null(),
   },
 });
 
@@ -398,6 +420,8 @@ export default async function plugin(bb: BbPluginApi) {
     return updated;
   }
 
+  bb.settings.define(SETTINGS);
+
   bb.rpc.register(rpcContract, {
     commands_get: async ({ threadId }) => {
       const [{ commands, configError }, runs] = await Promise.all([
@@ -441,6 +465,12 @@ export default async function plugin(bb: BbPluginApi) {
         ...new Set(runs.filter(isActive).map((run) => run.threadId)),
       ]);
       return { threadIds };
+    },
+    commands_display_fallback: async ({ requested, used }) => {
+      bb.log.warn(
+        `display "${requested}" is not available on this bb; using "${used}" instead.`,
+      );
+      return null;
     },
   });
 
