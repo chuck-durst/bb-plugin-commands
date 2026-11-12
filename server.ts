@@ -126,6 +126,11 @@ function trimSlashes(path: string): string {
  * `command` run through an interactive login shell, so it sees the same
  * environment as the user's own terminal.
  *
+ * `DISABLE_AUTO_UPDATE=true` turns off oh-my-zsh's update check for that
+ * shell: an interactive zsh asks "[oh-my-zsh] Would you like to update?" at
+ * the top of the logs and waits for an answer. Only oh-my-zsh reads it, and a
+ * `zstyle ':omz:update' mode` the user set still wins.
+ *
  * A bb terminal in command mode runs `$SHELL -c`, which skips `~/.zshrc`
  * (or `~/.bashrc`): version managers loaded there (nvm, fnm, asdf…) never
  * kick in, and `node` resolves to whatever sits on the bare PATH, which is
@@ -136,7 +141,7 @@ function trimSlashes(path: string): string {
 export function inUserShell(command: string, platform = process.platform): string {
   if (platform === "win32") return command;
   const quoted = `'${command.replaceAll("'", `'\\''`)}'`;
-  return `exec "\${SHELL:-/bin/sh}" -ilc ${quoted}`;
+  return `exec env DISABLE_AUTO_UPDATE=true "\${SHELL:-/bin/sh}" -ilc ${quoted}`;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
