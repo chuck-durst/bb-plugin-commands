@@ -18,6 +18,10 @@ workspace and shows its commands in a split button in the thread header.
 ```
 
 - The first command is the button's main action; the chevron lists all of them.
+  The plugin's **Header display** setting (`bb plugin config commands set
+  display <auto|plugin|bb>`) picks the plugin's own button (`auto`, the
+  default, while bb supports it) or entries in bb's shared header button
+  (`bb`, bb 0.49+, after Commit and PR Status).
 - `name` must be unique (1–80 characters). `command` runs in the machine's
   shell (`$SHELL` on macOS/Linux), with the workspace root as working directory.
 - Commit the file: new worktrees only contain tracked files, like
