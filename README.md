@@ -38,6 +38,16 @@ always run in the thread's own workspace.
 
 - **Thread header**: the left button runs the first command (and turns into
   *Stop* while it runs); the chevron lists every command and *Show logs*.
+- **Header display** setting (Settings → Installed plugins → Commands, or
+  `bb plugin config commands set display <value>`):
+  - `auto` (default): the plugin's own split button and logs panel while bb
+    supports them, else bb's shared header button;
+  - `plugin`: always the plugin's own button (bb's when this bb no longer
+    supports it; the plugin log says so);
+  - `bb`: entries in bb's shared header split button, after Commit and PR
+    Status (bb 0.49+; the first eight commands, every command stays in the
+    Commands tab). On older bb the plugin's own button stays, and the log
+    says so.
 - **Commands tab** (thread right panel): one entry per run with its status,
   read-only colored logs, Stop / Restart / remove.
 - **Sidebar**: threads with a running command show an animated indicator.
@@ -60,3 +70,8 @@ bb plugin install .      # or: bb plugin dev .
   `bb.storage.kv`, polls running ones, publishes `commands-changed`.
 - `app.tsx` — header split button, logs panel, sidebar indicator.
 - `lib/ansi.ts` — incremental ANSI parser for the logs view.
+- `lib/bb-compat.ts` — detects which header and panel slots this bb has and
+  picks the header display from the setting, at runtime.
+- `lib/header-actions.ts` — the entries of the `bb` header display.
+
+`npm test` runs the unit tests, `npm run typecheck` the type check.

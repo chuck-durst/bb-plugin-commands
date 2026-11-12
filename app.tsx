@@ -1,13 +1,24 @@
 // bb-plugin-commands — frontend.
 //
 // - Thread header: a split button. The left half runs (or stops) the first
-//   command of `.bb-commands.json`; the chevron lists every command.
+//   command of `.bb-commands.json`; the chevron lists every command. The
+//   `display` setting can swap it for entries of bb's shared header split
+//   button (bb 0.49+), which is also the fallback once bb drops the plugin's
+//   own header slot (see lib/bb-compat.ts).
 // - Thread panel tab "Commands": run list + read-only, colored logs.
 // - Sidebar: a running indicator on threads with an active command. Row
 //   statuses can only be set from a content script, which has no hooks, so an
 //   invisible app overlay fetches the running threads and hands them over.
 //   The PR Status plugin yields these rows (see `publishRunningRows`).
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { CSSProperties } from "react";
 import {
   definePluginApp,
@@ -16,11 +27,13 @@ import {
   useRealtimeConnectionState,
   useRpc,
   useSdk,
+  useSettings,
   type PluginComposerThreadRowStatus,
   type PluginRpcClient,
   type PluginThreadHeaderActionProps,
-  type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
+import * as sdkApp from "@get-bb/plugin-sdk/app";
+import { toast } from "sonner";
 import type { CommandDefinition, CommandRun, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import {
@@ -33,17 +46,56 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Icon } from "@/components/ui/icon";
 import { AnsiLog, lineSegments, type LogLine } from "@/lib/ansi";
+import {
+  detectCapabilities,
+  openLegacyLogsPanel,
+  openLogsTab,
+  parseDisplaySetting,
+  registerThreadUi,
+  resolveDisplay,
+  type DisplayChoice,
+  type HeaderThreadActionRegistration,
+  type PanelController,
+  type ThreadUiCapabilities,
+} from "@/lib/bb-compat";
+import {
+  MAX_HEADER_COMMANDS,
+  activeRunFor as findActiveRun,
+  commandHeaderAction,
+  isActive,
+  logsHeaderAction,
+  type HeaderActionHandlers,
+  type ThreadCommandsSnapshot,
+} from "@/lib/header-actions";
 import { cn } from "@/lib/utils";
 
 // Duplicated from server.ts: importing values from it would bundle the
 // backend into the app.
 const COMMANDS_CHANGED = "commands-changed";
 const CONFIG_FILE_NAME = ".bb-commands.json";
-const LOGS_PANEL_ID = "logs";
+const LOGS_TAB = { id: "logs", title: "Commands" };
 
-function isActive(run: CommandRun): boolean {
-  return run.status === "starting" || run.status === "running";
+// Set once by definePluginApp below, before anything renders.
+let capabilities: ThreadUiCapabilities = {
+  pluginHeader: false,
+  bbHeader: false,
+  legacyPanel: false,
+};
+
+/** The header display to draw, from the `display` setting; null while it loads. */
+function useDisplay(): DisplayChoice | null {
+  const { values, isLoading } = useSettings();
+  const setting = parseDisplaySetting(values?.display);
+  return useMemo(
+    () => (isLoading ? null : resolveDisplay(setting, capabilities)),
+    [isLoading, setting],
+  );
 }
+
+// Read from the namespace: SDK 0.6.15 has no typing for the panel controller.
+const useAppPanel = (sdkApp as Record<string, unknown>).experimental_useAppPanel as
+  | (() => unknown)
+  | undefined;
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -149,18 +201,28 @@ function useThreadCommands(threadId: string) {
 // Thread header split button
 // ---------------------------------------------------------------------------
 
+/** The "plugin" display; renders nothing while another display is chosen. */
+function CommandsHeaderSlot(props: PluginThreadHeaderActionProps) {
+  return useDisplay()?.display === "plugin" ? <CommandsHeaderAction {...props} /> : null;
+}
+
 function CommandsHeaderAction({ threadId, isCompactViewport }: PluginThreadHeaderActionProps) {
   const { commands, configError, runs, error, setError, start, stop } =
     useThreadCommands(threadId);
   const navigate = useBbNavigate();
+  const appPanel = useAppPanel?.();
   const [pending, setPending] = useState(false);
 
+  // `openThreadPanel` while bb has it, else the panel controller.
   const openLogs = useCallback(() => {
-    navigate.openThreadPanel({ actionId: LOGS_PANEL_ID, title: "Commands" });
-  }, [navigate]);
+    if (openLegacyLogsPanel(navigate, LOGS_TAB)) return;
+    if (typeof (appPanel as PanelController | undefined)?.openTab === "function") {
+      openLogsTab(appPanel as PanelController, LOGS_TAB);
+    }
+  }, [navigate, appPanel]);
 
   const activeRunFor = useCallback(
-    (name: string) => runs.find((run) => run.name === name && isActive(run)),
+    (name: string) => findActiveRun(runs, name),
     [runs],
   );
 
@@ -303,6 +365,196 @@ function CommandsHeaderAction({ threadId, isCompactViewport }: PluginThreadHeade
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Thread header actions (bb ≥ 0.49)
+// ---------------------------------------------------------------------------
+
+// bb runs each registration's `useData` once for the app, so the
+// MAX_HEADER_COMMANDS + 1 registrations share one store: the first one loads
+// and subscribes, the others only read it.
+interface HeaderCommandsState {
+  snapshots: ReadonlyMap<string, ThreadCommandsSnapshot>;
+  pending: ReadonlySet<string>;
+}
+
+const headerStore = {
+  state: { snapshots: new Map(), pending: new Set() } as HeaderCommandsState,
+  listeners: new Set<() => void>(),
+  update(next: (state: HeaderCommandsState) => HeaderCommandsState) {
+    headerStore.state = next(headerStore.state);
+    for (const listener of headerStore.listeners) listener();
+  },
+  subscribe(listener: () => void) {
+    headerStore.listeners.add(listener);
+    return () => {
+      headerStore.listeners.delete(listener);
+    };
+  },
+  snapshot: () => headerStore.state,
+};
+
+function setPending(threadId: string, pending: boolean) {
+  headerStore.update((state) => {
+    const next = new Set(state.pending);
+    if (pending) next.add(threadId);
+    else next.delete(threadId);
+    return { ...state, pending: next };
+  });
+}
+
+function refetchHeaderCommands(rpc: PluginRpcClient<typeof rpcContract>, threadId: string) {
+  rpc.call("commands_get", { threadId }).then(
+    (result) =>
+      headerStore.update((state) => {
+        const snapshots = new Map(state.snapshots);
+        snapshots.set(threadId, result);
+        return { ...state, snapshots };
+      }),
+    () => undefined,
+  );
+}
+
+interface HeaderCommandsData extends HeaderCommandsState {
+  /** False while the plugin's own display is chosen: every entry hides. */
+  shown: boolean;
+  toggle(threadId: string, name: string, onStarted: () => void): Promise<void>;
+}
+
+function useHeaderCommandsState(): HeaderCommandsData {
+  const rpc = useRpc<typeof rpcContract>();
+  const shown = useDisplay()?.display === "bb";
+  const state = useSyncExternalStore(headerStore.subscribe, headerStore.snapshot);
+  const toggle = useCallback(
+    async (threadId: string, name: string, onStarted: () => void) => {
+      if (headerStore.state.pending.has(threadId)) return;
+      const runs = headerStore.state.snapshots.get(threadId)?.runs ?? [];
+      const active = findActiveRun(runs, name);
+      setPending(threadId, true);
+      try {
+        if (active !== undefined) {
+          await rpc.call("commands_stop", { terminalId: active.terminalId });
+        } else {
+          await rpc.call("commands_start", { threadId, name });
+          onStarted();
+        }
+      } catch (cause) {
+        toast.error(errorMessage(cause));
+      } finally {
+        setPending(threadId, false);
+        refetchHeaderCommands(rpc, threadId);
+      }
+    },
+    [rpc],
+  );
+  return useMemo(() => ({ ...state, shown, toggle }), [state, shown, toggle]);
+}
+
+/** The loading half: `threadIds` are the threads whose header is on screen. */
+function useHeaderCommandsSync(input: { threadIds: readonly string[] }): HeaderCommandsData {
+  const rpc = useRpc<typeof rpcContract>();
+  const sdk = useSdk();
+  const data = useHeaderCommandsState();
+  // Nothing to load while the plugin's own display is chosen.
+  const threadIds = data.shown ? input.threadIds : NO_THREADS;
+  const idsKey = threadIds.join("\n");
+  const idsRef = useRef(threadIds);
+  idsRef.current = threadIds;
+
+  const refetchAll = useCallback(() => {
+    for (const threadId of idsRef.current) refetchHeaderCommands(rpc, threadId);
+  }, [rpc]);
+
+  useEffect(refetchAll, [idsKey, refetchAll]);
+  useRealtime(COMMANDS_CHANGED, (payload) => {
+    const threadId = changedThreadId(payload);
+    if (threadId !== null && idsRef.current.includes(threadId)) {
+      refetchHeaderCommands(rpc, threadId);
+    }
+  });
+  const connection = useRealtimeConnectionState();
+  useEffect(() => {
+    if (connection === "connected") refetchAll();
+  }, [connection, refetchAll]);
+
+  // Same as useThreadCommands: a new thread has no workspace yet, so re-read
+  // threads without commands when their thread or an environment changes.
+  const waitingKey = threadIds
+    .filter((threadId) => (data.snapshots.get(threadId)?.commands.length ?? 0) === 0)
+    .join("\n");
+  useEffect(() => {
+    if (waitingKey === "") return;
+    const waiting = waitingKey.split("\n");
+    const refetchWaiting = () => {
+      for (const threadId of waiting) refetchHeaderCommands(rpc, threadId);
+    };
+    const unsubscribes = waiting.map((threadId) =>
+      sdk.subscribe({ event: "thread:changed", threadId, callback: refetchWaiting }),
+    );
+    unsubscribes.push(sdk.subscribe({ event: "environment:changed", callback: refetchWaiting }));
+    return () => {
+      for (const unsubscribe of unsubscribes) unsubscribe();
+    };
+  }, [sdk, rpc, waitingKey]);
+
+  return data;
+}
+
+const NO_THREADS: readonly string[] = [];
+
+function headerHandlers(
+  data: HeaderCommandsData,
+  threadId: string,
+  panel: PanelController,
+): HeaderActionHandlers {
+  const openLogs = () => openLogsTab(panel, LOGS_TAB);
+  return {
+    pending: data.pending.has(threadId),
+    openLogs,
+    toggle: (name) => data.toggle(threadId, name, openLogs),
+  };
+}
+
+// Sorts after bb's Commit ("git") and PR Status ("pr-status") in the shared
+// header split button.
+const HEADER_GROUP = "run-commands";
+
+function headerActionRegistrations(): HeaderThreadActionRegistration<HeaderCommandsData>[] {
+  const commands = Array.from({ length: MAX_HEADER_COMMANDS }, (_, index) => ({
+    id: `run-command-${index}`,
+    title: index === 0 ? "Run first command" : `Run command ${index + 1}`,
+    icon: "Play",
+    group: HEADER_GROUP,
+    order: index,
+    placement: "header" as const,
+    useData: index === 0 ? useHeaderCommandsSync : useHeaderCommandsState,
+    item: ({ thread, data, experimental_panel }: HeaderItemInput) =>
+      commandHeaderAction(
+        data.shown ? data.snapshots.get(thread.id) : undefined,
+        index,
+        headerHandlers(data, thread.id, experimental_panel),
+      ),
+  }));
+  return [
+    ...commands,
+    {
+      id: "show-logs",
+      title: "Show command logs",
+      icon: "ScrollText",
+      group: HEADER_GROUP,
+      order: MAX_HEADER_COMMANDS,
+      placement: "header",
+      useData: useHeaderCommandsState,
+      item: ({ thread, data, experimental_panel }) =>
+        logsHeaderAction(
+          data.shown ? data.snapshots.get(thread.id) : undefined,
+          headerHandlers(data, thread.id, experimental_panel),
+        ),
+    },
+  ];
+}
+
+type HeaderItemInput = Parameters<HeaderThreadActionRegistration<HeaderCommandsData>["item"]>[0];
 
 // ---------------------------------------------------------------------------
 // Logs panel
@@ -457,7 +709,8 @@ function statusText(run: CommandRun): string {
   return run.exitCode === null ? "Exited" : `Exited with code ${run.exitCode}`;
 }
 
-function CommandsLogsPanel({ threadId }: PluginThreadPanelProps) {
+// Both the legacy thread panel and the 0.49 tab pass `threadId`.
+function CommandsLogsPanel({ threadId }: { threadId: string }) {
   const { rpc, commands, configError, runs, error, start, stop, dismiss } =
     useThreadCommands(threadId);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -677,22 +930,32 @@ function RunningThreadsSync() {
   useEffect(() => {
     if (connection === "connected") refetch();
   }, [connection, refetch]);
+
+  // Log once per change when the requested display is not available here.
+  const choice = useDisplay();
+  useEffect(() => {
+    if (choice?.fallbackFrom == null) return;
+    rpc
+      .call("commands_display_fallback", {
+        requested: choice.fallbackFrom,
+        used: choice.display,
+      })
+      .catch(() => undefined);
+  }, [rpc, choice?.fallbackFrom, choice?.display]);
   return null;
 }
 
 export default definePluginApp((app) => {
-  app.slots.experimental_threadHeaderAction({
-    id: "run-command",
-    title: "Commands",
-    component: CommandsHeaderAction,
-  });
-
-  app.slots.threadPanelAction({
-    id: LOGS_PANEL_ID,
-    title: "Commands",
-    icon: "SquareTerminal",
-    layout: "flush",
-    component: CommandsLogsPanel,
+  capabilities = detectCapabilities(app.slots, sdkApp);
+  registerThreadUi(capabilities, app.slots, {
+    pluginHeader: { id: "run-command", title: "Commands", component: CommandsHeaderSlot },
+    bbHeader: headerActionRegistrations(),
+    logsTab: {
+      ...LOGS_TAB,
+      icon: "SquareTerminal",
+      layout: "flush",
+      component: CommandsLogsPanel,
+    },
   });
 
   app.contentScripts.register({

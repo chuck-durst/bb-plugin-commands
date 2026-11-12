@@ -9,6 +9,7 @@
 // indicator stay current.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { DISPLAY_SETTINGS } from "./lib/bb-compat";
 
 export const CONFIG_FILE_NAME = ".bb-commands.json";
 
@@ -41,6 +42,22 @@ const runSchema = z.object({
 export type CommandRun = z.infer<typeof runSchema>;
 
 const outputChunkSchema = z.object({ seq: z.number(), dataBase64: z.string() });
+
+const displaySchema = z.enum(["plugin", "bb"]);
+
+/** Settings, editable in bb's plugin settings and `bb plugin config`. */
+const SETTINGS = {
+  display: {
+    type: "select" as const,
+    label: "Header display",
+    description:
+      "auto: the plugin's own button and logs panel while bb supports them, else bb's shared header button. " +
+      "plugin: always the plugin's own button (bb's when this bb no longer supports it). " +
+      "bb: entries in bb's shared header button, after Commit and PR Status (bb 0.49+).",
+    options: [...DISPLAY_SETTINGS],
+    default: "auto",
+  },
+};
 
 export const rpcContract = defineRpcContract({
   commands_get: {
@@ -79,6 +96,11 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ threadIds: z.array(z.string()) }),
   },
+  /** The app reports a `display` setting this bb cannot honor, for the log. */
+  commands_display_fallback: {
+    input: z.object({ requested: displaySchema, used: displaySchema }),
+    output: z.null(),
+  },
 });
 
 const RUNS_KEY = "runs";
@@ -104,6 +126,11 @@ function trimSlashes(path: string): string {
  * `command` run through an interactive login shell, so it sees the same
  * environment as the user's own terminal.
  *
+ * `DISABLE_AUTO_UPDATE=true` turns off oh-my-zsh's update check for that
+ * shell: an interactive zsh asks "[oh-my-zsh] Would you like to update?" at
+ * the top of the logs and waits for an answer. Only oh-my-zsh reads it, and a
+ * `zstyle ':omz:update' mode` the user set still wins.
+ *
  * A bb terminal in command mode runs `$SHELL -c`, which skips `~/.zshrc`
  * (or `~/.bashrc`): version managers loaded there (nvm, fnm, asdf…) never
  * kick in, and `node` resolves to whatever sits on the bare PATH, which is
@@ -114,7 +141,7 @@ function trimSlashes(path: string): string {
 export function inUserShell(command: string, platform = process.platform): string {
   if (platform === "win32") return command;
   const quoted = `'${command.replaceAll("'", `'\\''`)}'`;
-  return `exec "\${SHELL:-/bin/sh}" -ilc ${quoted}`;
+  return `exec env DISABLE_AUTO_UPDATE=true "\${SHELL:-/bin/sh}" -ilc ${quoted}`;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -398,6 +425,8 @@ export default async function plugin(bb: BbPluginApi) {
     return updated;
   }
 
+  bb.settings.define(SETTINGS);
+
   bb.rpc.register(rpcContract, {
     commands_get: async ({ threadId }) => {
       const [{ commands, configError }, runs] = await Promise.all([
@@ -441,6 +470,12 @@ export default async function plugin(bb: BbPluginApi) {
         ...new Set(runs.filter(isActive).map((run) => run.threadId)),
       ]);
       return { threadIds };
+    },
+    commands_display_fallback: async ({ requested, used }) => {
+      bb.log.warn(
+        `display "${requested}" is not available on this bb; using "${used}" instead.`,
+      );
+      return null;
     },
   });
 
